@@ -1,9 +1,12 @@
 package ognl;
 
 import org.hamcrest.core.IsEqual;
+import org.junit.After;
 import org.junit.Assert;
+import org.junit.Assume;
 import org.junit.Test;
 
+import java.lang.invoke.MethodHandles;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -102,8 +105,15 @@ class ExampleTwoMethodClass10 {
 
 public class OgnlRuntimeTest {
 
+    private final boolean expectedUseJPMSAutoOpenValue = expectedBooleanSystemProperty(OgnlRuntime.USE_JPMS_AUTO_OPEN, false);
+
     private static long cumulativelRunTestElapsedNanoTime;
     private static long totalNumberOfRunTestRuns;
+
+    @After
+    public void restoreUseJPMSAutoOpenFlag() {
+        OgnlRuntime.setUseJPMSAutoOpen(expectedUseJPMSAutoOpenValue);
+    }
 
     class Worker implements Callable<Class<?>[]> {
 
@@ -432,6 +442,26 @@ public class OgnlRuntimeTest {
     }
 
     /**
+     * Test OgnlRuntime value for _useJPMSAutoOpen based on the System property
+     *   represented by {@link OgnlRuntime#USE_JPMS_AUTO_OPEN}.
+     */
+    @Test
+    public void testUseJPMSAutoOpenStateFlag() {
+        System.out.println("Current OGNL value for use JPMS auto-open: " + OgnlRuntime.getUseJPMSAutoOpenValue());
+        Assert.assertEquals("Mismatch between system property (or default) and OgnlRuntime _useJPMSAutoOpen flag state ?",
+                expectedUseJPMSAutoOpenValue, OgnlRuntime.getUseJPMSAutoOpenValue());
+    }
+
+    @Test
+    public void testUseJPMSAutoOpenSetterOverridesEnvironment() {
+        OgnlRuntime.setUseJPMSAutoOpen(!expectedUseJPMSAutoOpenValue);
+        Assert.assertEquals(!expectedUseJPMSAutoOpenValue, OgnlRuntime.getUseJPMSAutoOpenValue());
+
+        OgnlRuntime.setUseJPMSAutoOpen(expectedUseJPMSAutoOpenValue);
+        Assert.assertEquals(expectedUseJPMSAutoOpenValue, OgnlRuntime.getUseJPMSAutoOpenValue());
+    }
+
+    /**
      * Test OgnlRuntime stricter invocation mode.
      */
     @Test
@@ -502,6 +532,72 @@ public class OgnlRuntimeTest {
         System.out.println("Current OGNL value for Use First Match Get/Set State Flag: " + OgnlRuntime.getUseFirstMatchGetSetLookupValue());
         Assert.assertEquals("Mismatch between system property (or default) and OgnlRuntime _useFirstMatchGetSetLookup flag state ?",
                 optionDefinedInEnvironment ? flagValueFromEnvironment : defaultValue, OgnlRuntime.getUseFirstMatchGetSetLookupValue());
+    }
+
+    @Test
+    public void testJPMSAutoOpenDisabledKeepsStaticMethodBlocked() throws Exception {
+        assumeJdk9Plus();
+        Assume.assumeTrue(JPMSAccessor.requiresOpenToOgnl(Class.forName("jdk.internal.perf.Perf")));
+
+        OgnlRuntime.setUseJPMSAutoOpen(false);
+        OgnlContext context = (OgnlContext) Ognl.createDefaultContext(null);
+
+        try {
+            Ognl.getValue("@jdk.internal.perf.Perf@getPerf()", asContextMap(context), (Object) null);
+            Assert.fail("Expected JPMS-protected static method call to fail when auto-open is disabled.");
+        } catch (OgnlException ex) {
+            Assert.assertTrue(ex.getMessage().contains("getPerf"));
+        }
+    }
+
+    @Test
+    public void testJPMSAutoOpenEnablesStaticMethodCall() throws Exception {
+        assumeJdk9Plus();
+
+        OgnlRuntime.setUseJPMSAutoOpen(true);
+        OgnlContext context = (OgnlContext) Ognl.createDefaultContext(null);
+
+        Object result = Ognl.getValue("@jdk.internal.perf.Perf@getPerf()", asContextMap(context), (Object) null);
+        Assert.assertNotNull(result);
+        Assert.assertEquals("jdk.internal.perf.Perf", result.getClass().getName());
+    }
+
+    @Test
+    public void testJPMSAutoOpenEnablesPrivateMethodInvoke() throws Exception {
+        assumeJdk9Plus();
+
+        OgnlRuntime.setUseJPMSAutoOpen(true);
+        Method method = MethodHandles.Lookup.class.getDeclaredMethod("readUnsignedShort", byte[].class, int.class);
+
+        Integer result = (Integer) OgnlRuntime.invokeMethod(null, method, new Object[]{new byte[]{0, 10}, Integer.valueOf(0)});
+        Assert.assertEquals(10, result.intValue());
+    }
+
+    @Test
+    public void testJPMSAutoOpenEnablesPrivateFieldRead() throws Exception {
+        assumeJdk9Plus();
+
+        OgnlRuntime.setUseJPMSAutoOpen(true);
+        OgnlContext context = (OgnlContext) Ognl.createDefaultContext(null, new DefaultMemberAccess(true));
+
+        Object result = OgnlRuntime.getFieldValue(context, MethodHandles.lookup(), "prevLookupClass", true);
+        Assert.assertTrue(result == null || result instanceof Class);
+    }
+
+    @Test
+    public void testJPMSAutoOpenEnablesStaticFieldRead() throws Exception {
+        assumeJdk9Plus();
+
+        OgnlRuntime.setUseJPMSAutoOpen(true);
+
+        OgnlContext publicContext = (OgnlContext) Ognl.createDefaultContext(null);
+        Object perf = Ognl.getValue("@jdk.internal.perf.Perf@getPerf()", asContextMap(publicContext), (Object) null);
+
+        OgnlContext privateContext = (OgnlContext) Ognl.createDefaultContext(null, new DefaultMemberAccess(true));
+        Object instance = OgnlRuntime.getStaticField(privateContext, "jdk.internal.perf.Perf", "instance");
+
+        Assert.assertNotNull(instance);
+        Assert.assertSame(perf, instance);
     }
 
     private Map defaultContext = Ognl.createDefaultContext(null, new DefaultMemberAccess(false));
@@ -619,5 +715,25 @@ public class OgnlRuntimeTest {
         root.put("d2", java.sql.Date.valueOf("2022-01-02"));
         Assert.assertEquals(-1,
                 Ognl.getValue("d1.compareTo(d2)", defaultContext, root));
+    }
+
+    private static boolean expectedBooleanSystemProperty(String propertyName, boolean defaultValue) {
+        try {
+            final String propertyString = System.getProperty(propertyName);
+            if (propertyString != null && propertyString.length() > 0) {
+                return Boolean.parseBoolean(propertyString);
+            }
+        } catch (Exception ex) {
+            // Unavailable (SecurityException, etc.)
+        }
+        return defaultValue;
+    }
+
+    private static void assumeJdk9Plus() {
+        Assume.assumeTrue(OgnlRuntime.detectMajorJavaVersion() >= 9);
+    }
+
+    private static Map asContextMap(OgnlContext context) {
+        return context;
     }
 }

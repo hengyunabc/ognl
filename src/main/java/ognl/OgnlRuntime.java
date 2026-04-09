@@ -35,7 +35,6 @@ import ognl.enhance.OgnlExpressionCompiler;
 import ognl.internal.ClassCache;
 import ognl.internal.ClassCacheImpl;
 import ognl.security.OgnlSecurityManagerFactory;
-import ognl.security.UserMethod;
 
 import java.beans.*;
 import java.lang.reflect.*;
@@ -69,6 +68,7 @@ public class OgnlRuntime {
     public static final Map NotFoundMap = new HashMap();
     public static final Object[] NoArguments = new Object[]{};
     public static final Class[] NoArgumentTypes = new Class[]{};
+    private static final String INACCESSIBLE_OBJECT_EXCEPTION_NAME = "java.lang.reflect.InaccessibleObjectException";
 
     /**
      * Token returned by TypeConverter for no conversion possible
@@ -145,6 +145,13 @@ public class OgnlRuntime {
     static final String USE_JDK9PLUS_ACESS_HANDLER = "ognl.UseJDK9PlusAccessHandler";
 
     /**
+     * Control usage of JPMS auto-open retry using the JVM option:
+     *   -Dognl.UseJPMSAutoOpen=true
+     *   -Dognl.UseJPMSAutoOpen=false
+     */
+    static final String USE_JPMS_AUTO_OPEN = "ognl.UseJPMSAutoOpen";
+
+    /**
      * Control usage of "stricter" invocation processing by invokeMethod() using the JVM options:
      *    -Dognl.UseStricterInvocation=true
      *    -Dognl.UseStricterInvocation=false
@@ -172,6 +179,24 @@ public class OgnlRuntime {
             // Unavailable (SecurityException, etc.)
         }
         _useJDK9PlusAccessHandler = initialFlagState;
+    }
+
+    /**
+     * Hold runtime flag state associated with USE_JPMS_AUTO_OPEN.
+     *   Default: false (if not set)
+     */
+    private static volatile boolean _useJPMSAutoOpen;
+    static {
+        boolean initialFlagState = false;
+        try {
+            final String propertyString = System.getProperty(USE_JPMS_AUTO_OPEN);
+            if (propertyString != null && propertyString.length() > 0) {
+                initialFlagState = Boolean.parseBoolean(propertyString);
+            }
+        } catch (Exception ex) {
+            // Unavailable (SecurityException, etc.)
+        }
+        _useJPMSAutoOpen = initialFlagState;
     }
 
     /**
@@ -1092,6 +1117,26 @@ public class OgnlRuntime {
     }
 
     /**
+     * Returns the value of the JPMS auto-open retry flag.
+     *
+     * @return true if JPMS auto-open retry is enabled, false otherwise.
+     */
+    public static boolean getUseJPMSAutoOpenValue()
+    {
+        return _useJPMSAutoOpen;
+    }
+
+    /**
+     * Sets the JPMS auto-open retry flag.
+     *
+     * @param value true to enable JPMS auto-open retry, false to disable it.
+     */
+    public static void setUseJPMSAutoOpen(boolean value)
+    {
+        _useJPMSAutoOpen = value;
+    }
+
+    /**
      * Permission will be named "invoke.&lt;declaring-class&gt;.&lt;method-name&gt;".
      *
      * @param method the Method whose Permission is being requested.
@@ -1114,6 +1159,113 @@ public class OgnlRuntime {
             }
         }
         return result;
+    }
+
+    static void setAccessibleWithAutoOpen(AccessibleObject accessibleObject, boolean flag) {
+        try {
+            _accessibleObjectHandler.setAccessible(accessibleObject, flag);
+        } catch (RuntimeException ex) {
+            if (!flag || !shouldRetryWithAutoOpen(ex, accessibleObject) ||
+                    !JPMSAccessor.openToOgnl(getDeclaringClass(accessibleObject))) {
+                throw ex;
+            }
+            _accessibleObjectHandler.setAccessible(accessibleObject, flag);
+        }
+    }
+
+    private static boolean shouldRetryWithAutoOpen(Throwable t, AccessibleObject accessibleObject) {
+        return shouldRetryWithAutoOpen(t, getDeclaringClass(accessibleObject));
+    }
+
+    private static boolean shouldRetryWithAutoOpen(Throwable t, Class declaringClass) {
+        return t != null
+                && declaringClass != null
+                && _jdk9Plus
+                && _useJPMSAutoOpen
+                && isJpmsAccessFailure(t)
+                && JPMSAccessor.requiresOpenToOgnl(declaringClass);
+    }
+
+    private static boolean isJpmsAccessFailure(Throwable t) {
+        return (t instanceof IllegalAccessException) || isInaccessibleObjectException(t);
+    }
+
+    private static boolean isInaccessibleObjectException(Throwable t) {
+        return t != null && INACCESSIBLE_OBJECT_EXCEPTION_NAME.equals(t.getClass().getName());
+    }
+
+    private static Class getDeclaringClass(AccessibleObject accessibleObject) {
+        return accessibleObject instanceof Member ? ((Member) accessibleObject).getDeclaringClass() : null;
+    }
+
+    private static Object invokeMethodWithAutoOpen(Object target, Method method, Object[] argsArray)
+            throws InvocationTargetException, IllegalAccessException {
+        try {
+            return method.invoke(target, argsArray);
+        } catch (IllegalAccessException ex) {
+            if (!shouldRetryWithAutoOpen(ex, method) || !JPMSAccessor.openToOgnl(method.getDeclaringClass())) {
+                throw ex;
+            }
+
+            final boolean wasAccessible = method.isAccessible();
+            if (!wasAccessible) {
+                setAccessibleWithAutoOpen(method, true);
+            }
+
+            try {
+                return method.invoke(target, argsArray);
+            } finally {
+                if (!wasAccessible) {
+                    setAccessibleWithAutoOpen(method, false);
+                }
+            }
+        }
+    }
+
+    private static Object getFieldValueWithAutoOpen(Field field, Object target) throws IllegalAccessException {
+        try {
+            return field.get(target);
+        } catch (IllegalAccessException ex) {
+            if (!shouldRetryWithAutoOpen(ex, field) || !JPMSAccessor.openToOgnl(field.getDeclaringClass())) {
+                throw ex;
+            }
+
+            final boolean wasAccessible = field.isAccessible();
+            if (!wasAccessible) {
+                setAccessibleWithAutoOpen(field, true);
+            }
+
+            try {
+                return field.get(target);
+            } finally {
+                if (!wasAccessible) {
+                    setAccessibleWithAutoOpen(field, false);
+                }
+            }
+        }
+    }
+
+    private static void setFieldValueWithAutoOpen(Field field, Object target, Object value) throws IllegalAccessException {
+        try {
+            field.set(target, value);
+        } catch (IllegalAccessException ex) {
+            if (!shouldRetryWithAutoOpen(ex, field) || !JPMSAccessor.openToOgnl(field.getDeclaringClass())) {
+                throw ex;
+            }
+
+            final boolean wasAccessible = field.isAccessible();
+            if (!wasAccessible) {
+                setAccessibleWithAutoOpen(field, true);
+            }
+
+            try {
+                field.set(target, value);
+            } finally {
+                if (!wasAccessible) {
+                    setAccessibleWithAutoOpen(field, false);
+                }
+            }
+        }
     }
 
     public static Object invokeMethod(Object target, Method method, Object[] argsArray)
@@ -1208,11 +1360,11 @@ public class OgnlRuntime {
                     }
                 }
 
-                _accessibleObjectHandler.setAccessible(method, true);
+                setAccessibleWithAutoOpen(method, true);
                 try {
                     result = invokeMethodInsideSandbox(target, method, argsArray);
                 } finally {
-                    _accessibleObjectHandler.setAccessible(method, false);
+                    setAccessibleWithAutoOpen(method, false);
                 }
             }
         } else
@@ -1237,12 +1389,12 @@ public class OgnlRuntime {
             throws InvocationTargetException, IllegalAccessException {
 
         if (_disableOgnlSecurityManagerOnInit) {
-            return method.invoke(target, argsArray);  // Feature was disabled at OGNL initialization.
+            return invokeMethodWithAutoOpen(target, method, argsArray);  // Feature was disabled at OGNL initialization.
         }
 
         try {
             if (System.getProperty(OGNL_SECURITY_MANAGER) == null) {
-                return method.invoke(target, argsArray);
+                return invokeMethodWithAutoOpen(target, method, argsArray);
             }
         } catch (SecurityException ignored) {
             // already enabled or user has applied a policy that doesn't allow read property so we have to honor user's sandbox
@@ -1254,7 +1406,11 @@ public class OgnlRuntime {
         }
 
         // creating object before entering sandbox to load classes out of the sandbox
-        UserMethod userMethod = new UserMethod(target, method, argsArray);
+        PrivilegedExceptionAction<Object> userMethod = new PrivilegedExceptionAction<Object>() {
+            public Object run() throws Exception {
+                return invokeMethodWithAutoOpen(target, method, argsArray);
+            }
+        };
         Permissions p = new Permissions(); // not any permission
         ProtectionDomain pd = new ProtectionDomain(null, p);
         AccessControlContext acc = new AccessControlContext(new ProtectionDomain[]{pd});
@@ -1269,7 +1425,7 @@ public class OgnlRuntime {
         }
         if (token == null) {
             // user has applied a policy that doesn't allow setSecurityManager so we have to honor user's sandbox
-            return method.invoke(target, argsArray);
+            return invokeMethodWithAutoOpen(target, method, argsArray);
         }
 
         // execute user method body with all permissions denied
@@ -2468,7 +2624,7 @@ public class OgnlRuntime {
                     if (!Modifier.isStatic(f.getModifiers())) {
                         final Object state = context.getMemberAccess().setup(context, target, f, propertyName);
                         try {
-                            result = f.get(target);
+                            result = getFieldValueWithAutoOpen(f, target);
                         } finally {
                             context.getMemberAccess().restore(context, target, f, propertyName, state);
                         }
@@ -2509,7 +2665,7 @@ public class OgnlRuntime {
                     try {
                         if (isTypeCompatible(value, f.getType())
                             || ((value = getConvertedType(context, target, f, propertyName, value, f.getType())) != null)) {
-                            f.set(target, value);
+                            setFieldValueWithAutoOpen(f, target, value);
                             result = true;
                         }
                     } finally {
@@ -2593,7 +2749,7 @@ public class OgnlRuntime {
             if (isAccessible(context, null, f, null)) {
                 final Object state = context.getMemberAccess().setup(context, null, f, null);
                 try {
-                    result = f.get(null);
+                    result = getFieldValueWithAutoOpen(f, null);
                 } finally {
                     context.getMemberAccess().restore(context, null, f, null, state);
                 }
