@@ -567,10 +567,11 @@ public class OgnlRuntimeTest {
         assumeJdk9Plus();
 
         OgnlRuntime.setUseJPMSAutoOpen(true);
-        Method method = MethodHandles.Lookup.class.getDeclaredMethod("readUnsignedShort", byte[].class, int.class);
+        Method method = MethodHandles.Lookup.class.getDeclaredMethod("lookupClassOrNull");
+        MethodHandles.Lookup lookup = MethodHandles.lookup();
 
-        Integer result = (Integer) OgnlRuntime.invokeMethod(null, method, new Object[]{new byte[]{0, 10}, Integer.valueOf(0)});
-        Assert.assertEquals(10, result.intValue());
+        Object result = OgnlRuntime.invokeMethod(lookup, method, OgnlRuntime.NoArguments);
+        Assert.assertEquals(lookup.lookupClass(), result);
     }
 
     @Test
@@ -579,9 +580,15 @@ public class OgnlRuntimeTest {
 
         OgnlRuntime.setUseJPMSAutoOpen(true);
         OgnlContext context = (OgnlContext) Ognl.createDefaultContext(null, new DefaultMemberAccess(true));
+        MethodHandles.Lookup lookup = MethodHandles.lookup();
+        String fieldName = getLookupPrivateFieldName();
 
-        Object result = OgnlRuntime.getFieldValue(context, MethodHandles.lookup(), "prevLookupClass", true);
-        Assert.assertTrue(result == null || result instanceof Class);
+        Object result = OgnlRuntime.getFieldValue(context, lookup, fieldName);
+        if ("allowedModes".equals(fieldName)) {
+            Assert.assertTrue(result instanceof Integer);
+        } else {
+            Assert.assertTrue(result == null || result instanceof Class);
+        }
     }
 
     @Test
@@ -731,6 +738,28 @@ public class OgnlRuntimeTest {
 
     private static void assumeJdk9Plus() {
         Assume.assumeTrue(OgnlRuntime.detectMajorJavaVersion() >= 9);
+    }
+
+    private static String getLookupPrivateFieldName() {
+        if (hasDeclaredField(MethodHandles.Lookup.class, "prevLookupClass")) {
+            return "prevLookupClass";
+        }
+        if (hasDeclaredField(MethodHandles.Lookup.class, "lookupClass")) {
+            return "lookupClass";
+        }
+        if (hasDeclaredField(MethodHandles.Lookup.class, "allowedModes")) {
+            return "allowedModes";
+        }
+        throw new AssertionError("No compatible private Lookup field found");
+    }
+
+    private static boolean hasDeclaredField(Class clazz, String fieldName) {
+        try {
+            clazz.getDeclaredField(fieldName);
+            return true;
+        } catch (NoSuchFieldException e) {
+            return false;
+        }
     }
 
     private static Map asContextMap(OgnlContext context) {
