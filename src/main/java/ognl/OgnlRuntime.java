@@ -35,6 +35,7 @@ import ognl.enhance.OgnlExpressionCompiler;
 import ognl.internal.ClassCache;
 import ognl.internal.ClassCacheImpl;
 import ognl.security.OgnlSecurityManagerFactory;
+import ognl.security.UserMethod;
 
 import java.beans.*;
 import java.lang.reflect.*;
@@ -1406,11 +1407,11 @@ public class OgnlRuntime {
         }
 
         // creating object before entering sandbox to load classes out of the sandbox
-        PrivilegedExceptionAction<Object> userMethod = new PrivilegedExceptionAction<Object>() {
+        PrivilegedExceptionAction<Object> userMethod = new UserMethod(new PrivilegedExceptionAction<Object>() {
             public Object run() throws Exception {
                 return invokeMethodWithAutoOpen(target, method, argsArray);
             }
-        };
+        });
         Permissions p = new Permissions(); // not any permission
         ProtectionDomain pd = new ProtectionDomain(null, p);
         AccessControlContext acc = new AccessControlContext(new ProtectionDomain[]{pd});
